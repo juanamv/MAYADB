@@ -62,7 +62,7 @@ MayaDB es particularmente adecuada para aplicaciones que requieren un alto grado
 > **Importante:** Si tienes problemas al generar los certificados, puedes usar HTTP; en ese protocolo MayaDB no requiere certificados.
 
 > **Recomendación (¡muy importante!):**
-> Para **pruebas y desarrollo local**, utiliza **HTTP**, ya que **el cliente QUIC aún no está completado** y actualmente **no existe forma de comunicarse con MayaDB vía QUIC** (puedes omitir la creación de certificados).
+> Para **pruebas y desarrollo local**, se recomienda **HTTP**, ya que aunque el servidor QUIC está listo, **el cliente oficial aún está en desarrollo**. Si no cuentas con certificados o necesitas la mínima fricción, trabaja sobre HTTP y omite la creación de `cert.pem`/`key.pem`.
 
 #### Par auto-firmado (pruebas)
 
@@ -153,6 +153,64 @@ Y ya tendrás tu servidor MayaDB corriendo con TLS y credenciales en entorno.
 >
 > * En el repositorio hay un `env.json` para cambiar `protocol` entre `http` o `quic`.
 > * Si modificas `protocol`, reinicia el servicio.
+
+#### Inicialización con parámetros CLI (nuevo flujo)
+
+Ahora el binario acepta sobreescritura directa desde la línea de comandos. Esto permite ajustar el servicio sin editar `env.json` ni depender exclusivamente de variables de entorno.
+
+Parámetros soportados:
+
+| Flag                    | Descripción                                                                                | Predeterminado                |
+|-------------------------|--------------------------------------------------------------------------------------------|-------------------------------|
+| `--port <u16>`          | Puerto de escucha.                                                                         | `8080` (HTTP) / `5000` (QUIC) |
+| `--protocol <http|quic>`| Protocolo expuesto. Se recomienda `http` en desarrollo.                                   | `quic`                        |
+| `--host <cadena>`       | Dirección de enlace (`127.0.0.1`, `0.0.0.0`, hostname).                                   | `localhost`                   |
+| `--path <ruta>`         | Carpeta para LMDB. Se crea si no existe.                                                  | `./MAYA_DB`                   |
+| `--user <cadena>`       | Usuario root inicial (sustituye `MAYA_USER`).                                             | cadena vacía                  |
+| `--pass <cadena>`       | Contraseña root inicial (sustituye `MAYA_PASS`).                                          | cadena vacía                  |
+| `--max-readers <u32>`   | Límite de lectores LMDB concurrentes.                                                     | `512`                         |
+| `--map-size <bytes>`    | Tamaño máximo del mapa LMDB (en bytes).                                                   | valor por defecto interno     |
+| `--generate-certs`      | Si se especifica, genera `cert.pem`/`key.pem` y finaliza sin levantar el servidor.        | `false`                       |
+
+Ejemplo de arranque personalizado:
+
+```bash
+./mayadb \
+  --protocol http \
+  --port 8080 \
+  --host 0.0.0.0 \
+  --path ./MAYA_DB \
+  --user admin \
+  --pass "admin-secret"
+```
+
+Otros escenarios comunes:
+
+- **CLI mínima (solo HTTP, credenciales embebidas):**
+
+  ```bash
+  ./mayadb --protocol http --user root --pass root
+  ```
+
+- **Servidor QUIC en puerto 5001, directorio dedicado:**
+
+  ```bash
+  ./mayadb \
+    --protocol quic \
+    --port 5001 \
+    --path /var/lib/mayadb \
+    --user quic_admin \
+    --pass "quic-secret"
+  ```
+
+- **Modo generación de certificados (no levanta servicio):**
+
+  ```bash
+  ./mayadb --generate-certs
+  # Resultado: cert.pem y key.pem en el directorio actual.
+  ```
+
+Si omites un flag, se utilizan los valores de `env.json` o los predeterminados en el binario. Esta modalidad facilita automatizaciones en contenedores, pipelines y entornos multi-stage.
 
 ---
 
@@ -396,7 +454,7 @@ Los scripts son especialmente útiles en casos en los que:
 
 #### Implementación de APIs (Próxima versión)
 
-Hasta ahora, la anotación `@script` no dispone de una API pública para interactuar directamente con MayaDB ni realizar peticiones HTTP desde JavaScript. Esto significa que los scripts no pueden, en su estado actual, consultar ni modificar datos de la base de datos ni comunicarse con servicios externos.
+Hasta ahora, la anotación `@script` no dispone de una API pública para interactuar directamente con MayaDB ni realizar peticiones HTTP desde JavaScript. Esto significa que los scripts no pueden, en su estado actual, consultar ni modificar datos de la base de datos ni comunicarse con servicios externos. **A partir de MayaDB 0.2.0** se añadieron los helpers descritos en la sección “APIs JavaScript embebidas (beta)”, pero permanecen limitados a operaciones de lectura y no habilitan escritura ni llamadas HTTP externas.
 
 En la siguiente versión de MayaDB se incluirán:
 
@@ -642,3 +700,58 @@ ns Team {
 | Cambiar relación  | `DELETE` → `CREATE`                    | Actualizar **no** está soportado            |
 
 Con esta estructura podrás describir, inspeccionar y depurar la autorización basada en grafos de MayaDB de manera consistente y transparente.
+
+---
+
+## APIs JavaScript embebidas (beta)
+
+Aunque la sección anterior mencionaba la ausencia de una API pública para scripts, desde **MayaDB 0.2.0** se expone un conjunto limitado de helper functions pensadas exclusivamente para lectura. El runtime sigue en fase **BETA**, por lo que la interfaz puede cambiar sin previo aviso y no se garantiza compatibilidad hacia atrás.
+
+### Funciones disponibles
+
+| Helper                              | Parámetros (JSON/string)                                                                 | Resultado                                          |
+|--------------------------------------|-------------------------------------------------------------------------------------------|----------------------------------------------------|
+| `await fetchKey(key)`                | Cadena con la clave LMDB exacta.                                                          | Cadena con el contenido bruto.                     |
+| `await fetchLinkForward(payload)`    | JSON serializado con `db`, `version`, `code`, `from_namespace`, `from_entity`, `from_role`, `to_namespace`, `to_entity`, `relation`.| JSON string con TTL (`ttl`), `from`, `to`, `relation`. |
+| `await fetchEntityData(payload)`     | JSON con `db`, `version`, `code`, `namespace`, `entity`.                                 | JSON string con los atributos almacenados.         |
+
+Ejemplo de uso dentro de `@script` (recordar que el script debe exportar `async function main()`):
+
+```javascript
+async function main() {
+  const entity = JSON.parse(await fetchEntityData(JSON.stringify({
+    db: "demo",
+    version: "1",
+    code: "alpha",
+    namespace: "User",
+    entity: "alice"
+  })));
+
+  if (entity.status !== "active") {
+    return { authorized: false, value: { reason: "inactive" } };
+  }
+
+  const link = JSON.parse(await fetchLinkForward(JSON.stringify({
+    db: "demo",
+    version: "1",
+    code: "alpha",
+    from_namespace: "User",
+    from_entity: "alice",
+    from_role: "owner",
+    to_namespace: "Group",
+    to_entity: "engineering",
+    relation: "member"
+  })));
+
+  return { authorized: true, value: { entity, link } };
+}
+```
+
+### Consideraciones y limitaciones
+
+- **Solo lectura**: actualmente no hay helpers para crear, actualizar o eliminar datos desde JS.
+- **Errores propagados**: si se consulta una clave inexistente, se recibe un error JavaScript (capturable con `try/catch`).
+- **Estado compartido**: el motor puede reciclar instancias; evita almacenar datos en variables globales.
+- **Rendimiento**: cada helper ejecuta operaciones LMDB y serializaciones JSON; úsalos con moderación.
+
+> **Importante**: debido a que el runtime JS continúa en beta, se recomienda limitar su uso a prototipos o decoradores ligeros y mantener la lógica principal en `@check` o en la aplicación cliente.
